@@ -1,12 +1,94 @@
 import numpy as np
 import optuna
 import torch
-from concurrent.futures import ThreadPoolExecutor, as_completed
+import multiprocessing as mp
+import time
+# 设置多进程启动方法为spawn以解决CUDA初始化问题
+if __name__ == '__main__':
+    mp.set_start_method('spawn', force=True)
+
+from concurrent.futures import ProcessPoolExecutor, as_completed
 import copy
+import os
 
 # 确保在模块级别初始化设备
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-print(f"BayesianOptimize using device: {device}")
+
+def _objective_function_internal(trial_number, trial_params, n_calls=30):
+    """
+    内部目标函数：在独立进程中执行
+    
+    Args:
+        trial_number: 试验编号
+        trial_params: 试验参数字典
+        n_calls: 总试验次数
+        
+    Returns:
+        评估奖励
+    """
+    # 重新导入模块以确保在新进程中正确加载
+    import torch
+    from td3_agent import HYPERPARAMS, create_env_and_agent, train_td3_agent
+    import copy
+    import numpy as np
+    
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    
+    # 使用深拷贝创建独立的超参数副本
+    hyperparams = copy.deepcopy(HYPERPARAMS)
+    hyperparams['hidden_dim'] = trial_params['hidden_dim']
+    hyperparams['reward_weights'] = hyperparams['reward_weights'].copy()
+    hyperparams['reward_weights']['orbit_improvement'] = trial_params['orbit_improvement_weight']
+    hyperparams['reward_weights']['action_penalty'] = trial_params['action_penalty_weight']
+    # 移除了completion_bonus，因为新的奖励函数不包含完成奖励
+    hyperparams['reward_weights']['divergence_penalty'] = trial_params['divergence_penalty_weight']
+    hyperparams['reward_weights']['stability_penalty'] = trial_params['stability_penalty_weight']
+    hyperparams['policy_noise'] = trial_params['policy_noise']
+    hyperparams['noise_clip'] = trial_params['noise_clip']
+    hyperparams['actor_lr'] = trial_params['actor_lr']
+    hyperparams['critic_lr'] = trial_params['critic_lr']
+    hyperparams['gamma'] = trial_params['gamma']
+    hyperparams['tau'] = trial_params['tau']
+    hyperparams['buffer_size'] = trial_params['buffer_size']
+    hyperparams['batch_size'] = trial_params['batch_size']
+    hyperparams['warmup_steps'] = trial_params['warmup_steps']
+    hyperparams['target_threshold'] = trial_params['target_threshold']
+    hyperparams['action_range'] = {
+        'min': trial_params['action_range_min'],
+        'max': trial_params['action_range_max']
+    }
+    hyperparams['cor_angle_limit'] = trial_params['cor_angle_limit']
+    hyperparams['verbose'] = False  # 关闭详细输出以减少并行训练时的日志
+    
+    # 根据优化阶段调整训练回合数
+    # 前30%试验使用快速评估
+    if trial_number < n_calls * 0.3:
+        hyperparams['max_episodes'] = 100  # 快速评估
+    # 中间50%试验使用中等评估
+    elif trial_number < n_calls * 0.8:
+        hyperparams['max_episodes'] = 300  # 中等评估
+    # 最后20%试验使用完整评估
+    else:
+        hyperparams['max_episodes'] = 500  # 完整评估
+    
+    try:
+        # 创建环境和智能体
+        env, agent = create_env_and_agent()
+        
+        # 训练智能体
+        episode_rewards, completion_rates = train_td3_agent(env, agent, hyperparams)
+        
+        # 评估性能（使用最后几次评估的平均奖励）
+        eval_rewards = []
+        for i in range(len(episode_rewards)-5, len(episode_rewards)):
+            if i >= 0:
+                eval_rewards.append(episode_rewards[i])
+        
+        avg_reward = np.mean(eval_rewards) if eval_rewards else -1000
+        
+        return trial_number, avg_reward
+    except Exception as e:
+        return trial_number, float('-inf')
 
 class BayesianOptimizer:
     def __init__(self, n_calls=30, random_state=42, fast_eval=False, n_jobs=1):
@@ -43,33 +125,53 @@ class BayesianOptimizer:
         print(f"Trial {trial.number} started on device: {device}")
         
         # 建议超参数
-        
-        # 建议超参数
+        hidden_dim = trial.suggest_categorical('hidden_dim', [64, 128, 256, 512])
         orbit_improvement_weight = trial.suggest_float('orbit_improvement_weight', 0.1, 100.0, log=True)
         action_penalty_weight = trial.suggest_float('action_penalty_weight', 0.1, 100.0, log=True)
-        completion_bonus = trial.suggest_float('completion_bonus', 10.0, 100.0, log=True)
-        policy_noise = trial.suggest_float('policy_noise', 0.05, 0.5, log=True)
+        # completion_bonus = trial.suggest_float('completion_bonus', 10.0, 50000.0, log=True)
+        divergence_penalty_weight = trial.suggest_float('divergence_penalty_weight', 0.1, 100.0, log=True)
+        stability_penalty_weight = trial.suggest_float('stability_penalty_weight', 0.1, 1000.0, log=True)
+        policy_noise = trial.suggest_float('policy_noise', 0.005, 0.99, log=True)
         noise_clip = trial.suggest_float('noise_clip', 0.1, 1.0, log=True)
-        actor_lr = trial.suggest_float('actor_lr', 1e-5, 1e-3, log=True)
-        critic_lr = trial.suggest_float('critic_lr', 1e-5, 1e-3, log=True)
-        gamma = trial.suggest_float('gamma', 0.9, 0.999)
-        tau = trial.suggest_float('tau', 0.001, 0.05, log=True)
+        actor_lr = trial.suggest_float('actor_lr', 1e-6, 1e-2, log=True)
+        critic_lr = trial.suggest_float('critic_lr', 1e-6, 1e-2, log=True)
+        gamma = trial.suggest_float('gamma', 0.8, 2.0)
+        tau = trial.suggest_float('tau', 0.0001, 0.1, log=True)
+        buffer_size = trial.suggest_categorical('buffer_size', [5000, 10000, 100000, 250000, 500000])
+        batch_size = trial.suggest_categorical('batch_size', [32, 64, 128, 256])
+        warmup_steps = trial.suggest_int('warmup_steps', 100, 10000)
+        target_threshold = trial.suggest_float('target_threshold', 1e-6, 1e-4, log=True)
+        action_range_min = trial.suggest_float('action_range_min', 1e-5, 1e-3, log=True)
+        action_range_max = trial.suggest_float('action_range_max', 1e-3, 1e-2, log=True)
+        cor_angle_limit = trial.suggest_float('cor_angle_limit', 0.05, 0.5, log=True)
         
         # 从td3_agent导入超参数（确保每次都是最新状态）
         from td3_agent import HYPERPARAMS
         
         # 使用深拷贝创建独立的超参数副本，防止多线程冲突
         hyperparams = copy.deepcopy(HYPERPARAMS)
+        hyperparams['hidden_dim'] = hidden_dim
         hyperparams['reward_weights'] = hyperparams['reward_weights'].copy()
         hyperparams['reward_weights']['orbit_improvement'] = orbit_improvement_weight
         hyperparams['reward_weights']['action_penalty'] = action_penalty_weight
-        hyperparams['reward_weights']['completion_bonus'] = completion_bonus
+        # 移除了completion_bonus，因为新的奖励函数不包含完成奖励
+        hyperparams['reward_weights']['divergence_penalty'] = divergence_penalty_weight
+        hyperparams['reward_weights']['stability_penalty'] = stability_penalty_weight
         hyperparams['policy_noise'] = policy_noise
         hyperparams['noise_clip'] = noise_clip
         hyperparams['actor_lr'] = actor_lr
         hyperparams['critic_lr'] = critic_lr
         hyperparams['gamma'] = gamma
         hyperparams['tau'] = tau
+        hyperparams['buffer_size'] = buffer_size
+        hyperparams['batch_size'] = batch_size
+        hyperparams['warmup_steps'] = warmup_steps
+        hyperparams['target_threshold'] = target_threshold
+        hyperparams['action_range'] = {
+            'min': action_range_min,
+            'max': action_range_max
+        }
+        hyperparams['cor_angle_limit'] = cor_angle_limit
         
         # 根据优化阶段调整训练回合数
         # 前30%试验使用快速评估
@@ -144,12 +246,11 @@ class BayesianOptimizer:
             
         print(f"总共计划进行 {n_trials} 次试验")
         print(f"并行任务数: {self.n_jobs}")
-        print(f"Using device: {device}")
         
         # 如果启用并行优化
         if self.n_jobs > 1:
-            print(f"使用 {self.n_jobs} 个线程进行并行优化")
-            self._parallel_optimize(n_trials)
+            print(f"使用 {self.n_jobs} 个进程进行并行优化")
+            return self._parallel_optimize(n_trials)
         else:
             # 运行优化
             self.study.optimize(self.objective_function, n_trials=n_trials)
@@ -161,12 +262,6 @@ class BayesianOptimizer:
         # 打印优化过程信息
         print("\n优化完成!")
         print(f"最佳奖励: {best_reward:.2f}")
-        print("\n优化历史:")
-        for i, trial in enumerate(self.study.trials):
-            if trial.value is not None:
-                print(f"试验 {i+1}: 奖励 = {trial.value:.2f}")
-            else:
-                print(f"试验 {i+1}: 失败")
         
         return best_params, best_reward
     
@@ -176,67 +271,80 @@ class BayesianOptimizer:
         
         Args:
             n_trials: 试验次数
+            
+        Returns:
+            best_params: 最佳参数
+            best_reward: 最佳奖励
         """
-        # 计算每个线程的任务数
-        trials_per_thread = n_trials // self.n_jobs
-        remaining_trials = n_trials % self.n_jobs
+        print(f"开始提交 {n_trials} 个并行任务...")
+        start_time = time.time()
         
-        def worker(thread_id, num_trials):
-            """
-            工作线程函数
-            
-            Args:
-                thread_id: 线程ID
-                num_trials: 该线程需要执行的试验数
-                
-            Returns:
-                试验结果列表
-            """
-            results = []
-            for i in range(num_trials):
-                # 为每个线程设置不同的随机种子
-                np.random.seed(self.random_state + thread_id * 1000)
-                torch.manual_seed(self.random_state + thread_id * 1000)
-                
-                # 创建独立的trial对象
-                trial = self.study.ask()
-                
-                try:
-                    print(f"\n线程 {thread_id} 开始试验 {i+1}/{num_trials}")
-                    
-                    # 执行目标函数
-                    value = self.objective_function(trial)
-                    
-                    # 报告试验结果
-                    self.study.tell(trial, value)
-                    results.append((trial.number, value))
-                    
-                    print(f"线程 {thread_id} 完成试验 {i+1}/{num_trials}，奖励: {value:.2f}")
-                except Exception as e:
-                    print(f"线程 {thread_id} 试验 {i+1} 失败: {str(e)}")
-                    self.study.tell(trial, float('-inf'))  # 失败试验给予负无穷奖励
-                    results.append((trial.number, float('-inf')))
-            
-            return results
+        # 记录已完成的任务数
+        completed_tasks = 0
         
-        # 使用线程池执行并行优化
-        with ThreadPoolExecutor(max_workers=self.n_jobs) as executor:
+        # 使用进程池执行并行优化
+        with ProcessPoolExecutor(max_workers=self.n_jobs, mp_context=mp.get_context('spawn')) as executor:
             # 提交任务
             futures = []
-            for i in range(self.n_jobs):
-                # 计算每个线程的试验数
-                num_trials = trials_per_thread + (1 if i < remaining_trials else 0)
-                if num_trials > 0:
-                    future = executor.submit(worker, i, num_trials)
-                    futures.append(future)
+            
+            for i in range(n_trials):
+                # 获取试验建议
+                trial = self.study.ask()
+                
+                # 获取试验参数
+                trial_params = {
+                    'hidden_dim': trial.suggest_categorical('hidden_dim', [64, 128, 256, 512]),
+                    'orbit_improvement_weight': trial.suggest_float('orbit_improvement_weight', 0.1, 1000.0, log=True),
+                    'action_penalty_weight': trial.suggest_float('action_penalty_weight', 0.1, 100.0, log=True),
+                    'completion_bonus': trial.suggest_float('completion_bonus', 100.0, 10000.0, log=True),
+                    'divergence_penalty_weight': trial.suggest_float('divergence_penalty_weight', 0.1, 1000.0, log=True),
+                    'stability_penalty_weight': trial.suggest_float('stability_penalty_weight', 0.1, 500.0, log=True),
+                    'policy_noise': trial.suggest_float('policy_noise', 0.05, 0.5, log=True),
+                    'noise_clip': trial.suggest_float('noise_clip', 0.1, 1.0, log=True),
+                    'actor_lr': trial.suggest_float('actor_lr', 1e-5, 1e-3, log=True),
+                    'critic_lr': trial.suggest_float('critic_lr', 1e-5, 1e-3, log=True),
+                    'gamma': trial.suggest_float('gamma', 0.9, 0.999),
+                    'tau': trial.suggest_float('tau', 0.001, 0.05, log=True),
+                    'buffer_size': trial.suggest_categorical('buffer_size', [100000, 250000, 500000, 1000000]),
+                    'batch_size': trial.suggest_categorical('batch_size', [32, 64, 128, 256]),
+                    'warmup_steps': trial.suggest_int('warmup_steps', 500, 5000),
+                    'target_threshold': trial.suggest_float('target_threshold', 1e-6, 1e-4, log=True),
+                    'action_range_min': trial.suggest_float('action_range_min', 1e-5, 1e-3, log=True),
+                    'action_range_max': trial.suggest_float('action_range_max', 1e-3, 1e-2, log=True),
+                    'cor_angle_limit': trial.suggest_float('cor_angle_limit', 0.05, 0.5, log=True)
+                }
+                
+                # 提交任务
+                future = executor.submit(_objective_function_internal, trial.number, trial_params, self.n_calls)
+                futures.append((future, trial))
             
             # 等待所有任务完成
-            for future in as_completed(futures):
+            results = {}
+            for future, trial in futures:
                 try:
-                    results = future.result()
-                    print(f"线程完成，返回 {len(results)} 个结果")
+                    trial_number, value = future.result()
+                    results[trial_number] = value
+                    self.study.tell(trial, value)
+                    completed_tasks += 1
+                    elapsed_time = time.time() - start_time
+                    print(f"[{time.strftime('%H:%M:%S')}] 任务 {trial_number+1}/{n_trials} 完成，奖励: {value:.2f}，已用时: {elapsed_time:.1f}s")
                 except Exception as e:
-                    print(f"线程执行出错: {str(e)}")
+                    print(f"任务 {trial.number} 失败: {str(e)}")
+                    self.study.tell(trial, float('-inf'))  # 失败试验给予负无穷奖励
+                    results[trial.number] = float('-inf')
+        
+        total_time = time.time() - start_time
+        print(f"\n所有 {n_trials} 个任务已完成 ({completed_tasks} 成功)，总用时: {total_time:.1f}s")
+        
+        # 获取最佳参数和奖励
+        best_params = self.study.best_params
+        best_reward = self.study.best_value
+        
+        # 打印优化过程信息
+        print("\n优化完成!")
+        print(f"最佳奖励: {best_reward:.2f}")
+        
+        return best_params, best_reward
 
 def print_best_params(params):
     """
@@ -247,5 +355,35 @@ def print_best_params(params):
     """
     print("最佳超参数:")
     print("=" * 30)
-    for name, value in params.items():
-        print(f"{name}: {value:.6f}")
+    # 按照重要性排序打印参数
+    if isinstance(params, dict):
+        # 如果是字典格式（Optuna结果）
+        print(f"hidden_dim: {params.get('hidden_dim', 'N/A')}")
+        print(f"orbit_improvement_weight: {params.get('orbit_improvement_weight', 'N/A'):.6f}")
+        print(f"action_penalty_weight: {params.get('action_penalty_weight', 'N/A'):.6f}")
+        print(f"completion_bonus: {params.get('completion_bonus', 'N/A'):.6f}")
+        print(f"divergence_penalty_weight: {params.get('divergence_penalty_weight', 'N/A'):.6f}")
+        print(f"policy_noise: {params.get('policy_noise', 'N/A'):.6f}")
+        print(f"noise_clip: {params.get('noise_clip', 'N/A'):.6f}")
+        print(f"actor_lr: {params.get('actor_lr', 'N/A'):.6f}")
+        print(f"critic_lr: {params.get('critic_lr', 'N/A'):.6f}")
+        print(f"gamma: {params.get('gamma', 'N/A'):.6f}")
+        print(f"tau: {params.get('tau', 'N/A'):.6f}")
+        print(f"buffer_size: {params.get('buffer_size', 'N/A')}")
+        print(f"batch_size: {params.get('batch_size', 'N/A')}")
+        print(f"warmup_steps: {params.get('warmup_steps', 'N/A')}")
+        print(f"target_threshold: {params.get('target_threshold', 'N/A'):.6e}")
+        print(f"action_range_min: {params.get('action_range_min', 'N/A'):.6f}")
+        print(f"action_range_max: {params.get('action_range_max', 'N/A'):.6f}")
+        print(f"cor_angle_limit: {params.get('cor_angle_limit', 'N/A'):.6f}")
+    else:
+        # 如果是列表格式（旧版结果）
+        param_names = [
+            'orbit_improvement_weight', 'action_penalty_weight', 'completion_bonus',
+            'policy_noise', 'noise_clip', 'actor_lr', 'critic_lr', 'gamma', 'tau'
+        ]
+        for name, value in zip(param_names, params):
+            if name in ['target_threshold']:
+                print(f"{name}: {value:.6e}")
+            else:
+                print(f"{name}: {value:.6f}")

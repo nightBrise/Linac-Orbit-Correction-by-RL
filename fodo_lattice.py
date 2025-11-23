@@ -19,6 +19,7 @@ QD6 = Quadrupole(l=0.3, k1=-1)
 D1 = Drift(l=2)
 D2 = Drift(l=0.06)
 
+M0 = Monitor(l=0)
 M1 = Monitor(l=0)
 M2 = Monitor(l=0)
 M3 = Monitor(l=0)
@@ -58,7 +59,8 @@ CV10 = Vcor(l=0, angle=0)
 CV11 = Vcor(l=0, angle=0)
 CV12 = Vcor(l=0, angle=0)
 
-cell = (CH1, CV1, D2, D1, QF1, D2, M1,  
+cell = (M0, D1,
+        CH1, CV1, D2, D1, QF1, D2, M1,  
         CH2, CV2, D2, D1, QD1, D2, M2, 
         CH3, CV3, D2, D1, QF2, D2, M3,  
         CH4, CV4, D2, D1, QD2, D2, M4, 
